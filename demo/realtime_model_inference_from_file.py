@@ -11,6 +11,8 @@ from vibevoice.modular.modeling_vibevoice_streaming_inference import VibeVoiceSt
 from vibevoice.processor.vibevoice_streaming_processor import VibeVoiceStreamingProcessor
 from transformers.utils import logging
 
+from coreml.wrapped_inference import WrappedInferenceModel
+
 logging.set_verbosity_info()
 logger = logging.get_logger(__name__)
 
@@ -102,7 +104,7 @@ def parse_args():
     parser.add_argument(
         "--txt_path",
         type=str,
-        default="demo/text_examples/1p_vibevoice.txt",
+        default="demo/text_examples/1p_vibevoice copy.txt",
         help="Path to the txt file containing the script",
     )
     parser.add_argument(
@@ -171,7 +173,8 @@ def main():
 
     # Decide dtype & attention implementation
     if args.device == "mps":
-        load_dtype = torch.float32  # MPS requires float32
+        # load_dtype = torch.float32  # MPS requires float32
+        load_dtype = torch.bfloat16  # MPS requires float32
         attn_impl_primary = "sdpa"  # flash_attention_2 not supported on MPS
     elif args.device == "cuda":
         load_dtype = torch.bfloat16
@@ -246,6 +249,8 @@ def main():
             inputs[k] = v.to(target_device)
 
     print(f"Starting generation with cfg_scale: {args.cfg_scale}")
+
+    model = WrappedInferenceModel(model, "vibe_voice_lm_model_seqlen_32.mlpackage")
 
     # Generate audio
     start_time = time.time()
