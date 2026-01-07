@@ -1108,6 +1108,7 @@ class NumPyStreamingGenerator:
         
         # Initialize audio chunks
         audio_chunks = [[] for _ in range(batch_size)]
+        speech_latent_buffer = []
         acoustic_cache = []  # Simple list for cache
         
         # Prepare prefilled outputs
@@ -1233,18 +1234,37 @@ class NumPyStreamingGenerator:
                     negative_condition,
                     cfg_scale=cfg_scale,
                 ) # .unsqueeze(1)
-                                
-                # Decode acoustic latent to audio using acoustic streaming cache
-                scaled_latent = speech_latent / self.speech_scaling_factor - self.speech_bias_factor
-                audio_chunk = self.acoustic_detokenizer.decode(
-                    scaled_latent,
-                )
-                audio_chunks[0].append(audio_chunk)
+                
+                # Buffer speech latents
+                speech_latent_buffer.append(speech_latent)
+                
+                SPEECH_DECODING_BATCH_SIZE = 12
 
-                # Add streaming support here
-                if audio_streamer is not None:
-                    # Stream the audio chunks immediately
-                    audio_streamer.put(audio_chunk, 0)
+                # Decode if buffer is full
+                if len(speech_latent_buffer) >= SPEECH_DECODING_BATCH_SIZE:
+                    # Concatenate latents
+                    # speech_latent is (1, dim), so stack/cat to (Batch, dim)
+                    batch_latents = np.stack(speech_latent_buffer, axis=-1) # (B, dim)
+                    
+                    # Decode acoustic latent to audio using acoustic streaming cache
+                    scaled_latents = batch_latents / self.speech_scaling_factor - self.speech_bias_factor
+                    audio_chunk = self.acoustic_detokenizer.decode(
+                        scaled_latents,
+                    )
+                    # audio_chunk might be (B, Samples) or (B*Samples) depending on squeeze.
+                    # Ensure it is flat for appending
+                    if audio_chunk.ndim > 1:
+                        audio_chunk = audio_chunk.flatten()
+                        
+                    audio_chunks[0].append(audio_chunk)
+
+                    # Add streaming support here
+                    if audio_streamer is not None:
+                        # Stream the audio chunks immediately
+                        audio_streamer.put(audio_chunk, 0)
+                    
+                    # Clear buffer
+                    speech_latent_buffer = []
 
                 acoustic_embed = self._apply_speech_connector(speech_latent)[..., None]
 
@@ -1284,6 +1304,21 @@ class NumPyStreamingGenerator:
                     print("FINISHED")
                     finished = True
                     break
+            
+        # Flush remaining tokens in buffer if finished or loop ends (though loop is per window, we must check buffer emptiness)
+        # Actually, the outer loop continues. We only need to flush if 'finished' is True.
+        # But wait, if we exit inner loop but not finished, buffer remains for next outer loop? 
+        # Yes, that's fine.
+        if len(speech_latent_buffer) > 0:
+            batch_latents = np.stack(speech_latent_buffer, axis=-1)
+            scaled_latents = batch_latents / self.speech_scaling_factor - self.speech_bias_factor
+            audio_chunk = self.acoustic_detokenizer.decode(scaled_latents)
+            if audio_chunk.ndim > 1:
+                audio_chunk = audio_chunk.flatten()
+            audio_chunks[0].append(audio_chunk)
+            if audio_streamer is not None:
+                audio_streamer.put(audio_chunk, 0)
+            speech_latent_buffer = []
 
         print("FINISHED")
 
@@ -1351,9 +1386,14 @@ class NumPyAcousticDetokenizerCoreMLModel:
         debug: bool = False,
     ) -> np.ndarray:
         """Decode acoustic latents to audio."""
+        input_x = latents
         if latents.ndim == 2:
             # (B, H) -> (B, H, 1)
             input_x = latents[..., None]
+        if latents.shape[-1] != 12:
+            # pad
+            pad_size = 12 - latents.shape[-1]
+            input_x = np.pad(latents, ((0, 0), (0, 0), (0, pad_size)))
         
         output = self.mlmodel.predict({
             "input_x": input_x,
@@ -1368,8 +1408,15 @@ class NumPyAcousticDetokenizerCoreMLModel:
         })
         
         for i in range(len(self.stages_caches)):
+            # since padding is probably added only on the latest decoding
+            # step it shouldn't be necessary to slice the cache
             self.caches[i][:] = output[f"new_cache_{i}"]
         
+        # if latents.shape[-1] != 12:
+        #     output = output["output"][..., :3200 * latents.shape[0]]
+        # else:
+        #     output = output["output"]
+
         return output["output"].squeeze()
 
 
