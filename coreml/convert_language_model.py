@@ -6,22 +6,12 @@ from vibevoice.modular.modeling_vibevoice_streaming_inference import VibeVoiceSt
 from coreml.wrapped_inference import load_past_key_values_into_state
 from coreml.layers import *
 
-def main():
-    model_path = "microsoft/VibeVoice-Realtime-0.5B"
-    model = VibeVoiceStreamingForConditionalGenerationInference.from_pretrained(
-        model_path,
-        torch_dtype=torch.bfloat16,
-        device_map="cpu",
-        # attn_implementation=attn_impl_primary,
-    )
-
-    target_model = model.model.language_model
-    
+def main(target_model, bsz, output_path):    
     with torch.inference_mode():
         target_model.eval().float()
         patch_for_ane(target_model, AttentionANEWraperChannelsFirstWithCache)
         patch_for_ane(target_model, ANELinearWrapper)
-        patch_for_ane(target_model, WrappedRMSNorm, )
+        patch_for_ane(target_model, WrappedRMSNorm)
         wrapped_base_llm = LMModelANEWrapperWithCache(target_model, device="cpu", channels_first=True)
         wrapped_base_llm.eval().float()
 
@@ -35,7 +25,6 @@ def main():
     with torch.inference_mode():
         traced_model = torch.jit.trace(wrapped_base_llm, example_inputs=example_inputs)
 
-    bsz = 32
     base_mlmodel = ct.convert(
         traced_model,
         # convert_to="milinternal",
@@ -65,7 +54,7 @@ def main():
                 ),
             ],
     )
-    base_mlmodel.save(f"vibe_voice_lm_model_seqlen_{bsz}.mlpackage")
+    base_mlmodel.save(output_path)
 
 def test(torch_model, coreml_model, coreml_model_length):
     with torch.inference_mode():
@@ -87,8 +76,8 @@ def test(torch_model, coreml_model, coreml_model_length):
             use_cache=True,
         )
 
-    coreml_input_embeds = torch.transpose(inputs_embeds, 1, 2).unsqueeze(-2)
-    coreml_input_embeds = torch.nn.functional.pad(coreml_input_embeds, (0, coreml_model_length - seqlen)).float().numpy()
+    # coreml_input_embeds = torch.transpose(inputs_embeds, 1, 2).unsqueeze(-2)
+    # coreml_input_embeds = torch.nn.functional.pad(coreml_input_embeds, (0, coreml_model_length - seqlen)).float().numpy()
 
     state = coreml_model.make_state()
     # coreml_output = coreml_model.predict({
@@ -105,7 +94,7 @@ def test(torch_model, coreml_model, coreml_model_length):
         "position_id": np.array([seqlen], dtype=np.int32),
     }, state)
 
-    target_hidden_states = initial_output.last_hidden_state.transpose(1, 2).unsqueeze(-2)
+    # target_hidden_states = initial_output.last_hidden_state.transpose(1, 2).unsqueeze(-2)
 
     # ANE Float16 gives results that are more than a bit off so an allclose
     # would need a high tolerance, but a quick manual inspection we hope that
@@ -208,12 +197,22 @@ def test(torch_model, coreml_model, coreml_model_length):
 
 
 if __name__ == "__main__":
-    # main()
 
-    torch_model = VibeVoiceStreamingForConditionalGenerationInference.from_pretrained(
-        "microsoft/VibeVoice-Realtime-0.5B",
+    model_path = "microsoft/VibeVoice-Realtime-0.5B"
+    model = VibeVoiceStreamingForConditionalGenerationInference.from_pretrained(
+        model_path,
         torch_dtype=torch.bfloat16,
         device_map="cpu",
-    ).model.language_model
-    coreml_model = ct.models.MLModel("vibe_voice_lm_model_seqlen_32.mlpackage", compute_units=ct.ComputeUnit.CPU_AND_NE)
-    test(torch_model, coreml_model, coreml_model_length=32)
+        # attn_implementation=attn_impl_primary,
+    )
+    # main()
+    bsz = 8
+    main(model.model.tts_language_model, bsz=bsz, output_path=f"vibe_voice_tts_lm_model_seqlen_{bsz}.mlpackage")
+
+    # torch_model = VibeVoiceStreamingForConditionalGenerationInference.from_pretrained(
+    #     "microsoft/VibeVoice-Realtime-0.5B",
+    #     torch_dtype=torch.bfloat16,
+    #     device_map="cpu",
+    # ).model.language_model
+    # coreml_model = ct.models.MLModel("vibe_voice_lm_model_seqlen_32.mlpackage", compute_units=ct.ComputeUnit.CPU_AND_NE)
+    # test(torch_model, coreml_model, coreml_model_length=32)
