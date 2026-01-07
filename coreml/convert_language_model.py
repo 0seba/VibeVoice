@@ -19,8 +19,9 @@ def main(target_model, bsz, output_path):
     print(target_model)
 
     example_inputs = (
-        torch.randn((1, 896, 1, 1)).float(),
-        torch.zeros((1,), dtype=torch.int32),
+        torch.randn((2, 896, 1, bsz)).float(), # Batched input (2, 896, 1, 1)
+        torch.zeros((1,), dtype=torch.int32), # position_id
+        torch.zeros((1,), dtype=torch.int32), # negative_position_id
     )
     with torch.inference_mode():
         traced_model = torch.jit.trace(wrapped_base_llm, example_inputs=example_inputs)
@@ -33,8 +34,9 @@ def main(target_model, bsz, output_path):
         minimum_deployment_target=ct.target.iOS18,
         # skip_model_load=skip_model_load,
         inputs=[
-            ct.TensorType(shape=(1, 896, 1, bsz), name="inputs_embeds"),
-            ct.TensorType(shape=example_inputs[1].shape, name="position_id", dtype=np.int32),
+            ct.TensorType(shape=(2, 896, 1, bsz), name="inputs_embeds"),
+            ct.TensorType(shape=(1,), name="position_id", dtype=np.int32),
+            ct.TensorType(shape=(1,), name="negative_position_id", dtype=np.int32),
         ],
         outputs=[
             ct.TensorType(name="output"),
@@ -51,6 +53,18 @@ def main(target_model, bsz, output_path):
                         shape=wrapped_base_llm.value_cache.shape,
                     ),
                     name="value_cache",
+                ),
+                ct.StateType(
+                    wrapped_type=ct.TensorType(
+                        shape=wrapped_base_llm.key_cache_neg.shape,
+                    ),
+                    name="key_cache_neg",
+                ),
+                ct.StateType(
+                    wrapped_type=ct.TensorType(
+                        shape=wrapped_base_llm.value_cache_neg.shape,
+                    ),
+                    name="value_cache_neg",
                 ),
             ],
     )
@@ -207,7 +221,7 @@ if __name__ == "__main__":
     )
     # main()
     bsz = 8
-    main(model.model.tts_language_model, bsz=bsz, output_path=f"vibe_voice_tts_lm_model_seqlen_{bsz}.mlpackage")
+    main(model.model.tts_language_model, bsz=bsz, output_path=f"vibevoice_tts_lm_model_fused_seqlen_{bsz}.mlpackage")
 
     # torch_model = VibeVoiceStreamingForConditionalGenerationInference.from_pretrained(
     #     "microsoft/VibeVoice-Realtime-0.5B",

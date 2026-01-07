@@ -760,63 +760,93 @@ class NumPyStreamingGenerator:
         lm_output = coreml_outputs["output"][..., :input_length]  # (B, H, S)
         return lm_output
     
-    def _forward_tts_lm_numpy(
+    def _forward_tts_lm_batched_numpy(
         self,
         inputs_embeds: np.ndarray,
         cache_position: np.ndarray,
-        past_key_values: Optional[Any] = None,
+        negative_cache_position: Optional[np.ndarray],
         tts_text_masks: Optional[np.ndarray] = None,
-        use_negative_state: bool = False,
-    ) -> Tuple[np.ndarray, np.ndarray, Any]:
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Forward pass through TTS language model using CoreML.
+        Batched Forward pass through TTS language model using CoreML (Batch Size 2).
+        Handles both positive and negative conditions in a single pass.
         
         Args:
-            inputs_embeds: Input embeddings.
-            cache_position: Current cache position.
-            past_key_values: KV cache state.
+            inputs_embeds: Input embeddings (1, C, 1, 1).
+            cache_position: Current positive cache position (1,).
+            negative_cache_position: Current negative cache position (1,) or None.
             tts_text_masks: Mask indicating text (1) vs speech (0) tokens.
-            use_negative_state: If True, use separate negative TTS LM state.
             
         Returns:
-            Tuple of (last_hidden_state, logits, new_kv_state).
+            Tuple of (pos_output, neg_output).
         """
-        input_length = inputs_embeds.shape[-1]
-        coreml_inputs_embeds = inputs_embeds + self.tts_input_types[tts_text_masks].transpose(0, 2, 1)[:, :, None, :]
+        # inputs_embeds is (1, 896, 1, 1) usually.
+        # We need to construct (2, 896, 1, 1).
         
-        MLMODEL_INPUT_LENGTH = 8
-        # Pad to MLMODEL_INPUT_LENGTH tokens if needed
-        if input_length < MLMODEL_INPUT_LENGTH:
-            padding = np.zeros((1, inputs_embeds.shape[1], 1, MLMODEL_INPUT_LENGTH - input_length), dtype=np.float16)
-            coreml_inputs_embeds = np.concatenate([coreml_inputs_embeds, padding], axis=-1)
+        # Apply type conditioning (Speech vs Text)
+        # tts_text_masks is (1, 1) usually.
+        # self.tts_input_types is assumed to be (2, C) or similar embeddings.
         
-        # Create or reuse state (separate states for positive and negative)
-        if use_negative_state:
-            if self.tts_lm_state_negative is None or not self.tts_lm_state_negative.is_initialized:
-                self.tts_lm_state_negative = self.tts_lm_mlmodel.make_state()
-                self.tts_lm_state_negative.is_initialized = True
-            state = self.tts_lm_state_negative
+        # Prepare conditioned input
+        # Note: If tts_text_masks applies to both positive and negative identically (which it does for shared acoustic input),
+        # we can apply it before duplication.
+        type_embed = self.tts_input_types[tts_text_masks].transpose(0, 2, 1)[:, :, None, :] # (1, C, 1, 1)
+        conditioned_input = inputs_embeds + type_embed
+        
+        # Duplicate for batch size 2
+        # Input shape becomes (2, 896, 1, 1)
+        if negative_cache_position is not None:
+            coreml_inputs_embeds = np.concatenate([conditioned_input, conditioned_input], axis=0)
+            neg_pos_input = negative_cache_position
         else:
-            if self.tts_lm_state is None or not self.tts_lm_state.is_initialized:
-                self.tts_lm_state = self.tts_lm_mlmodel.make_state()
-                self.tts_lm_state.is_initialized = True
-            state = self.tts_lm_state
+            # Single condition case: Pad negative slot with zeros
+            # Although we duplicate positive input to keep tensor valid, or use zeros.
+            # Using zeros for the second slot to avoid affecting state if possible, though state update will happen.
+            # However, since we ignore output and presumably won't use negative state again, it might be fine.
+            # Better safe: use zeros.
+            zeros_input = np.zeros_like(conditioned_input)
+            coreml_inputs_embeds = np.concatenate([conditioned_input, zeros_input], axis=0)
+            neg_pos_input = np.array([0], dtype=np.int32)
+
+        # Pad sequence length if needed (MLMODEL_INPUT_LENGTH)
+        # Warning: This padding logic in original code padded the LAST dimension (Time?).
+        # Original: (1, 896, 1, 1) -> pad last dim to 8?
+        # Check original code:
+        # MLMODEL_INPUT_LENGTH = 8
+        # if input_length < MLMODEL_INPUT_LENGTH:
+        #    padding = np.zeros((..., MLMODEL_INPUT_LENGTH - input_length))
+        #    coreml_inputs_embeds = np.concatenate([..., padding], axis=-1)
         
-        # CoreML inference (same model, different state)
+        input_length = inputs_embeds.shape[-1]
+        MLMODEL_INPUT_LENGTH = 8
+        if input_length < MLMODEL_INPUT_LENGTH:
+            # Pad the LAST dimension (W)
+            padding_shape = list(coreml_inputs_embeds.shape)
+            padding_shape[-1] = MLMODEL_INPUT_LENGTH - input_length
+            padding = np.zeros(padding_shape, dtype=np.float16)
+            coreml_inputs_embeds = np.concatenate([coreml_inputs_embeds, padding], axis=-1)
+
+        # Ensure state initialized
+        if self.tts_lm_state is None or not self.tts_lm_state.is_initialized:
+            self.tts_lm_state = self.tts_lm_mlmodel.make_state()
+            self.tts_lm_state.is_initialized = True
+        
+        # CoreML inference
+        # Input: inputs_embeds (2, ...), position_id (1,), negative_position_id (1,)
         coreml_outputs = self.tts_lm_mlmodel.predict({
             "inputs_embeds": coreml_inputs_embeds,
             "position_id": cache_position,
-        }, state)
+            "negative_position_id": neg_pos_input,
+        }, self.tts_lm_state)
         
-        # Extract output and reshape - output shape is (B, H, 1, S)
-        lm_output = coreml_outputs["output"][..., :input_length]  # (B, H, S)
+        # Extract output
+        # Output is (2, 896, 1, 8) potentially. Slice to input length.
+        raw_output = coreml_outputs["output"][..., :input_length] # (2, C, 1, 1)
         
-        # Compute EOS logits from last hidden state
-        # last_hidden = lm_output[..., -1]
-        # logits = self._compute_eos_logits(last_hidden)
+        pos_output = raw_output[0:1] # (1, C, 1, 1)
+        neg_output = raw_output[1:2] if negative_cache_position is not None else None
         
-        # return lm_output, logits
-        return lm_output
+        return pos_output, neg_output
     
     def _forward_tts_lm_negative_numpy(
         self,
@@ -954,6 +984,8 @@ class NumPyStreamingGenerator:
         past_key_values: Any,
         mlmodel: Any,
         state: Any,
+        key_name: str = "key_cache",
+        value_name: str = "value_cache",
     ):
         """
         Load PyTorch past_key_values into CoreML MLState.
@@ -962,6 +994,8 @@ class NumPyStreamingGenerator:
             past_key_values: PyTorch past_key_values tuple structure.
             mlmodel: The CoreML model.
             state: The CoreML MLState to write to.
+            key_name: Name of the key cache state buffer.
+            value_name: Name of the value cache state buffer.
         """
         if past_key_values is None:
             return
@@ -985,8 +1019,8 @@ class NumPyStreamingGenerator:
         value_cache_np = value_cache.cpu().float().numpy()
         
         # Get state buffer shapes and pad if necessary
-        key_state_shape = state.read_state("key_cache").shape
-        value_state_shape = state.read_state("value_cache").shape
+        key_state_shape = state.read_state(key_name).shape
+        value_state_shape = state.read_state(value_name).shape
         
         # Pad key_cache if needed
         if key_cache_np.shape[2] < key_state_shape[2]:
@@ -999,8 +1033,8 @@ class NumPyStreamingGenerator:
             value_cache_np = np.pad(value_cache_np, pad_width, mode='constant')
         
         # Write to state
-        state.write_state("key_cache", key_cache_np)
-        state.write_state("value_cache", value_cache_np)
+        state.write_state(key_name, key_cache_np)
+        state.write_state(value_name, value_cache_np)
     
     def _prepare_prefilled_outputs(
         self,
@@ -1043,21 +1077,34 @@ class NumPyStreamingGenerator:
             if self.tts_lm_state is None or not self.tts_lm_state.is_initialized:
                 self.tts_lm_state = self.tts_lm_mlmodel.make_state()
                 self.tts_lm_state.is_initialized = True
+            
+            # Load POSITIVE cache
             self._load_past_key_values_into_coreml_state(
-                tts_lm_past_key_values, self.tts_lm_mlmodel, self.tts_lm_state
+                tts_lm_past_key_values, 
+                self.tts_lm_mlmodel, 
+                self.tts_lm_state,
+                key_name="key_cache",
+                value_name="value_cache"
             )
         else:
             tts_lm_cache_position = 0
         
         # 3. Load negative TTS LM cache
+        # Note: We reuse self.tts_lm_state because the single state object now holds both sets of buffers.
         tts_lm_negative_past_key_values = all_prefilled_outputs.get("neg_tts_lm", {}).get("past_key_values")
         if tts_lm_negative_past_key_values is not None:
             tts_lm_negative_cache_position = tts_lm_negative_past_key_values._seen_tokens
-            if self.tts_lm_state_negative is None or not self.tts_lm_state_negative.is_initialized:
-                self.tts_lm_state_negative = self.tts_lm_mlmodel.make_state()
-                self.tts_lm_state_negative.is_initialized = True
+            if self.tts_lm_state is None or not self.tts_lm_state.is_initialized:
+                self.tts_lm_state = self.tts_lm_mlmodel.make_state()
+                self.tts_lm_state.is_initialized = True
+
+            # Load NEGATIVE cache
             self._load_past_key_values_into_coreml_state(
-                tts_lm_negative_past_key_values, self.tts_lm_mlmodel, self.tts_lm_state_negative
+                tts_lm_negative_past_key_values, 
+                self.tts_lm_mlmodel, 
+                self.tts_lm_state,
+                key_name="key_cache_neg",
+                value_name="value_cache_neg"
             )
         else:
             tts_lm_negative_cache_position = 0
@@ -1217,11 +1264,24 @@ class NumPyStreamingGenerator:
                 lm_cache_position += input_ids.shape[1]
 
                 # Forward pass through the model
-                tts_lm_outputs = self._forward_tts_lm_numpy(
+                # Note: This block handles PROMPT/TEXT tokens (prefill of new text).
+                # New text tokens usually update only POSITIVE cache? Or both?
+                # Original code calls `_forward_tts_lm_numpy` with `use_negative_state=False`.
+                # So we update ONLY positive cache.
+                # We should pass `negative_cache_position=None` to ensure we don't assume negative update.
+                # But wait, does this mean negative state becomes stale/lagging?
+                # Usually text tokens are shared context. Negative cache (unconditional) might NOT see text?
+                # "tts_text_masks=np.ones_like(input_ids)" implies text.
+                # If negative condition is "unconditional", it shouldn't see text tokens?
+                # In standard CFG, negative path (uncond) usually sees an empty string or start token, but NOT the text prompt.
+                # So the caches diverge here. Positive sees text, Negative does NOT.
+                # Therefore, we call batched with `negative_cache_position=None` (single condition).
+                
+                tts_lm_outputs, _ = self._forward_tts_lm_batched_numpy(
                     inputs_embeds=outputs,
                     cache_position=tts_lm_cache_position,
+                    negative_cache_position=None, # Only update positive cache for text tokens
                     tts_text_masks=np.ones_like(input_ids),
-                    use_negative_state=False,
                 )
                 tts_lm_cache_position += input_ids.shape[1]
 
@@ -1278,20 +1338,13 @@ class NumPyStreamingGenerator:
                     progress_bar.update(1)
                     progress_bar.set_description(f"Prefilled {total_prefilled_text_tokens} text tokens, generated {total_generated_speech_tokens} speech tokens, current step ({step} / {max_length})")
 
-                tts_lm_outputs = self._forward_tts_lm_numpy(
+                tts_lm_outputs, tts_lm_negative_output = self._forward_tts_lm_batched_numpy(
                     inputs_embeds=acoustic_embed,
                     cache_position=tts_lm_cache_position,
+                    negative_cache_position=tts_lm_negative_cache_position,
                     tts_text_masks=np.zeros((1, 1), dtype=np.int32),
-                    use_negative_state=False,
                 )
                 tts_lm_cache_position += 1
-
-                tts_lm_negative_output = self._forward_tts_lm_numpy(
-                    inputs_embeds=acoustic_embed,
-                    cache_position=tts_lm_negative_cache_position,
-                    tts_text_masks=np.zeros((1, 1), dtype=np.int32),
-                    use_negative_state=True,
-                )
                 tts_lm_negative_cache_position += 1
 
                 tts_eos_logits = self._compute_eos_logits(tts_lm_outputs[..., -1])
