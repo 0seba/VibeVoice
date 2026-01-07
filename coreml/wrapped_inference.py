@@ -1209,82 +1209,125 @@ class NumPyStreamingGenerator:
 
         finished = False
 
+        # Constants for batch processing
+        TEXT_PROCESSING_BATCH_SIZE = 32
+        
+        # Buffer for LM hidden states
+        lm_hidden_state_buffer = None # Will be initialized on first batch
+        
+        # Text processing tracking
+        current_text_idx = 0
+        total_text_tokens = tts_text_ids.shape[1]
+        
         while not finished:
             if finished:
                 break
+                
             # Check for external stop signal
             if stop_check_fn is not None and stop_check_fn():
                 if verbose:
                     print(f"Generation stopped externally at step {step + 1}")
-                # End the audio streamer if it exists
                 if audio_streamer is not None:
                     audio_streamer.end()
                 break
+
+            # 1. Refill buffer if needed and possible
+            # We need to refill if we have fewer than TTS_TEXT_WINDOW_SIZE tokens AND there is more text to process
+            # Or if the buffer is empty and there is more text
+            buffer_len = lm_hidden_state_buffer.shape[-1] if lm_hidden_state_buffer is not None else 0
             
-            # # Check if audio_streamer has been ended (stopped externally)
-            # if audio_streamer is not None and hasattr(audio_streamer, 'finished_flags'):
-            #     if any(audio_streamer.finished_flags):
-            #         if verbose:
-            #             print(f"Audio generation stopped externally at step {step + 1}")
-            #         break
-            
-            # if finished_tags.all():
-            #     if hasattr(progress_bar, 'set_description'):
-            #         progress_bar.set_description("Generation complete")
-            #     break
+            while (buffer_len < TTS_TEXT_WINDOW_SIZE) and (current_text_idx < total_text_tokens):
+                # Calculate chunk size
+                remaining_text = total_text_tokens - current_text_idx
+                chunk_size = min(TEXT_PROCESSING_BATCH_SIZE, remaining_text)
+                
+                # Get chunk of text IDs
+                chunk_ids = tts_text_ids[:, current_text_idx : current_text_idx + chunk_size]
+                current_text_idx += chunk_size
+                
+                if verbose:
+                        print(f"Processing text chunk of size {chunk_size}, progress: {current_text_idx}/{total_text_tokens}")
 
-            cur_input_tts_text_ids = tts_text_ids[:, tts_text_window_index*TTS_TEXT_WINDOW_SIZE:(tts_text_window_index+1)*TTS_TEXT_WINDOW_SIZE]
-            next_text_window_size = tts_text_ids[:, (tts_text_window_index+1)*TTS_TEXT_WINDOW_SIZE:(tts_text_window_index+2)*TTS_TEXT_WINDOW_SIZE].shape[1]
-            tts_text_window_index += 1
-
-            if cur_input_tts_text_ids.shape[1] > 0:
-                input_ids = cur_input_tts_text_ids
-                tts_lm_input_ids = cur_input_tts_text_ids
-
-                if tts_lm_input_ids.shape[1] > max_length:
+                # Check max length
+                if step + chunk_size > max_length:
                     if verbose:
-                        print(f"Reached maximum generation length {max_length}, stopped it.")
-                    # reached_samples = torch.arange(batch_size, device=device)[~finished_tags]
-                    # if reached_samples.numel() > 0:
-                    #     reach_max_step_sample[reached_samples] = True
+                        print(f"Reached maximum generation length {max_length} during text processing, stopped it.")
                     finished = True
                     break
                 
-                step += cur_input_tts_text_ids.shape[1]
-                total_prefilled_text_tokens += cur_input_tts_text_ids.shape[1]
+                # Update counters
+                step += chunk_size
+                total_prefilled_text_tokens += chunk_size
                 if progress_bar is not None:
-                    progress_bar.update(cur_input_tts_text_ids.shape[1])
+                    progress_bar.update(chunk_size)
                     progress_bar.set_description(f"Prefilled {total_prefilled_text_tokens} text tokens, generated {total_generated_speech_tokens} speech tokens, current step ({step} / {max_length})")
 
-                # Forward pass through the model
-                outputs = self._forward_lm_numpy(
-                    input_ids,
+                # Forward pass through LM
+                lm_outputs_chunk = self._forward_lm_numpy(
+                    chunk_ids,
                     cache_position=lm_cache_position,
                 )
-                lm_cache_position += input_ids.shape[1]
-
-                # Forward pass through the model
-                # Note: This block handles PROMPT/TEXT tokens (prefill of new text).
-                # New text tokens usually update only POSITIVE cache? Or both?
-                # Original code calls `_forward_tts_lm_numpy` with `use_negative_state=False`.
-                # So we update ONLY positive cache.
-                # We should pass `negative_cache_position=None` to ensure we don't assume negative update.
-                # But wait, does this mean negative state becomes stale/lagging?
-                # Usually text tokens are shared context. Negative cache (unconditional) might NOT see text?
-                # "tts_text_masks=np.ones_like(input_ids)" implies text.
-                # If negative condition is "unconditional", it shouldn't see text tokens?
-                # In standard CFG, negative path (uncond) usually sees an empty string or start token, but NOT the text prompt.
-                # So the caches diverge here. Positive sees text, Negative does NOT.
-                # Therefore, we call batched with `negative_cache_position=None` (single condition).
+                lm_cache_position += chunk_size
                 
-                tts_lm_outputs, _ = self._forward_tts_lm_batched_numpy(
-                    inputs_embeds=outputs,
-                    cache_position=tts_lm_cache_position,
-                    negative_cache_position=None, # Only update positive cache for text tokens
-                    tts_text_masks=np.ones_like(input_ids),
-                )
-                tts_lm_cache_position += input_ids.shape[1]
+                # Add to buffer
+                if lm_hidden_state_buffer is None:
+                    lm_hidden_state_buffer = lm_outputs_chunk
+                else:
+                    lm_hidden_state_buffer = np.concatenate([lm_hidden_state_buffer, lm_outputs_chunk], axis=-1)
+                
+                buffer_len = lm_hidden_state_buffer.shape[-1]
 
+            # if finished:
+                # break
+
+            # 2. Consume from buffer to feed TTS LM
+            buffer_len = lm_hidden_state_buffer.shape[-1] if lm_hidden_state_buffer is not None else 0
+            if buffer_len > 0:
+
+                # Determine how many tokens to consume
+                # If we have at least TTS_TEXT_WINDOW_SIZE (5), take 5.
+                # If we have less than 5, ONLY proceed if we have processed all input text.
+                if buffer_len >= TTS_TEXT_WINDOW_SIZE:
+                    consume_size = TTS_TEXT_WINDOW_SIZE
+                elif current_text_idx >= total_text_tokens:
+                    # No more text available, consume what's left
+                    consume_size = buffer_len
+                else:
+                    # Should not assume we can proceed if we have < 5 and more text (the while loop above should have refilled)
+                    # But just in case logic falls through or TEXT_PROCESSING_BATCH_SIZE is small (unlikely < 5)
+                    # We continue to let the loop refill again
+                    continue
+                    
+                # Extract chunk from buffer
+                batch_inputs_embeds = lm_hidden_state_buffer[..., :consume_size]
+                # Remove from buffer
+                lm_hidden_state_buffer = lm_hidden_state_buffer[..., consume_size:]
+                
+                # Create mask (all ones for text)
+                batch_masks = np.ones((1, consume_size), dtype=np.int32)
+
+                # Forward pass through TTS LM (Text ingestion)
+                tts_lm_outputs, _ = self._forward_tts_lm_batched_numpy(
+                    inputs_embeds=batch_inputs_embeds,
+                    cache_position=tts_lm_cache_position,
+                    negative_cache_position=None, # Only update positive cache
+                    tts_text_masks=batch_masks,
+                )
+                tts_lm_cache_position += consume_size
+
+            # 3. Speech Generation Loop
+            # Perform 6 iterations of speech generation for the consumed text window
+            # Note: The original code used a fixed TTS_SPEECH_WINDOW_SIZE (6) loop.
+            # We essentially keep this behavior. For every 5 (or fewer) text tokens, we generate some speech.
+            # Wait, simply iterating 6 times regardless of consumed text size?
+            # The original code did: "for cur_speech_index in range(TTS_SPEECH_WINDOW_SIZE):"
+            # inside the loop over text windows.
+            # Even if the text window was smaller (e.g. end of sentence)?
+            # Original code: 
+            # cur_input_tts_text_ids = ... (size can be < 5 at end)
+            # loops 6 times.
+            # So yes, we maintain 6 iterations per consumption step.
+            
             for cur_speech_index in range(TTS_SPEECH_WINDOW_SIZE):
                 positive_condition = tts_lm_outputs[..., -1:]
                 negative_condition = tts_lm_negative_output
@@ -1293,7 +1336,7 @@ class NumPyStreamingGenerator:
                     positive_condition,
                     negative_condition,
                     cfg_scale=cfg_scale,
-                ) # .unsqueeze(1)
+                )
                 
                 # Buffer speech latents
                 speech_latent_buffer.append(speech_latent)
@@ -1302,8 +1345,7 @@ class NumPyStreamingGenerator:
 
                 # Decode if buffer is full
                 if len(speech_latent_buffer) >= SPEECH_DECODING_BATCH_SIZE:
-                    # Concatenate latents
-                    # speech_latent is (1, dim), so stack/cat to (Batch, dim)
+                        # Concatenate latents
                     batch_latents = np.stack(speech_latent_buffer, axis=-1) # (B, dim)
                     
                     # Decode acoustic latent to audio using acoustic streaming cache
@@ -1311,8 +1353,7 @@ class NumPyStreamingGenerator:
                     audio_chunk = self.acoustic_detokenizer.decode(
                         scaled_latents,
                     )
-                    # audio_chunk might be (B, Samples) or (B*Samples) depending on squeeze.
-                    # Ensure it is flat for appending
+                    
                     if audio_chunk.ndim > 1:
                         audio_chunk = audio_chunk.flatten()
                         
@@ -1328,7 +1369,7 @@ class NumPyStreamingGenerator:
 
                 acoustic_embed = self._apply_speech_connector(speech_latent)[..., None]
 
-                if tts_lm_input_ids.shape[1] > max_length:
+                if step >= max_length: # Check >= just in case
                     finished = True
                     break
                 
@@ -1350,18 +1391,12 @@ class NumPyStreamingGenerator:
                 tts_eos_logits = self._compute_eos_logits(tts_lm_outputs[..., -1])
 
                 if tts_eos_logits.item() > 0:
-                    # If EOS token is predicted, we can stop generation for this sample
-                    # finished_tags[0] = True
                     if audio_streamer is not None:
                         audio_streamer.end(0)
-                    print("FINISHED")
                     finished = True
                     break
-            
-        # Flush remaining tokens in buffer if finished or loop ends (though loop is per window, we must check buffer emptiness)
-        # Actually, the outer loop continues. We only need to flush if 'finished' is True.
-        # But wait, if we exit inner loop but not finished, buffer remains for next outer loop? 
-        # Yes, that's fine.
+        
+        # Flush remaining tokens in buffer if finished or loop ends
         if len(speech_latent_buffer) > 0:
             batch_latents = np.stack(speech_latent_buffer, axis=-1)
             scaled_latents = batch_latents / self.speech_scaling_factor - self.speech_bias_factor
@@ -1372,8 +1407,6 @@ class NumPyStreamingGenerator:
             if audio_streamer is not None:
                 audio_streamer.put(audio_chunk, 0)
             speech_latent_buffer = []
-
-        print("FINISHED")
 
         final_audio_outputs = []
         for sample_chunks in audio_chunks:

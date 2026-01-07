@@ -106,7 +106,8 @@ def parse_args():
     parser.add_argument(
         "--txt_path",
         type=str,
-        default="demo/text_examples/1p_vibevoice copy.txt",
+        # default="demo/text_examples/1p_vibevoice copy.txt",
+        default="demo/text_examples/1p_vibevoice.txt",
         help="Path to the txt file containing the script",
     )
     parser.add_argument(
