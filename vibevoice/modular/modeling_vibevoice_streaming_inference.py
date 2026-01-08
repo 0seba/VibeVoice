@@ -259,12 +259,13 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
             VibeVoiceCausalLMOutputWithPast with `logits` (EOS), `last_hidden_state`, `past_key_values`.
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        
+
         # Get embeddings
         if inputs_embeds is None:
             # Will be replaced with lm_last_hidden_state
             inputs_embeds = self.model.get_input_embeddings()(input_ids)
         
+        print("tts lm shapes", input_ids.shape, inputs_embeds.shape, lm_last_hidden_state.shape)
         # Replace the last part of inputs_embeds with lm_last_hidden_state
         start_idx = inputs_embeds.shape[1] - lm_last_hidden_state.shape[1]
         inputs_embeds[:, start_idx:, :] = lm_last_hidden_state
@@ -571,6 +572,7 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
                 outputs = self.forward_lm(
                     **model_inputs, return_dict=True, output_attentions=False, output_hidden_states=False,
                 )
+                print("LM outputs last hidden state shape:", outputs.last_hidden_state.shape)
                 model_kwargs = _update_model_kwargs_for_generation(
                     outputs, model_kwargs, num_new_tokens=next_text_window_size,
                 )
@@ -592,12 +594,15 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
             for cur_speech_index in range(TTS_SPEECH_WINDOW_SIZE):
                 positive_condition = tts_lm_outputs.last_hidden_state[diffusion_indices, -1, :]
                 negative_condition = tts_lm_negative_outputs.last_hidden_state[diffusion_indices, -1, :]
+                # print("Positive condition", positive_condition)
+                # print("Negative condition", negative_condition)
                 
                 speech_latent = self.sample_speech_tokens(
                     positive_condition,
                     negative_condition,
                     cfg_scale=cfg_scale,
                 ).unsqueeze(1)
+                # print("Generated speech latent shape:", speech_latent)
                                 
                 # Decode acoustic latent to audio using acoustic streaming cache
                 scaled_latent = speech_latent / self.model.speech_scaling_factor.to(speech_latent.device) - self.model.speech_bias_factor.to(speech_latent.device)
@@ -608,6 +613,7 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
                     use_cache=True,
                     debug=False
                 )
+                # print("Decoded audio chunk shape:", audio_chunk.shape)
                 
                 # Store audio chunks for each sample
                 for i, sample_idx in enumerate(diffusion_indices):
@@ -642,6 +648,7 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
                 tts_lm_outputs = self.forward_tts_lm(
                     **tts_lm_model_inputs, **tts_lm_additional_inputs, return_dict=True, output_attentions=False, output_hidden_states=False,
                 )
+                # print("TTS LM outputs last hidden state shape:", tts_lm_outputs.last_hidden_state)
                 if cur_speech_index == TTS_SPEECH_WINDOW_SIZE - 1 and next_text_window_size > 0:
                     tts_lm_model_kwargs = _update_model_kwargs_for_generation(
                         tts_lm_outputs, tts_lm_model_kwargs, num_new_tokens=next_text_window_size,
@@ -661,6 +668,7 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
                 tts_lm_negative_outputs = self.forward_tts_lm(
                     **tts_lm_negative_model_inputs, **tts_lm_negative_additional_inputs, return_dict=True, output_attentions=False, output_hidden_states=False,
                 )
+                # print("TTS LM Negative outputs last hidden state shape:", tts_lm_negative_outputs.last_hidden_state)
                 tts_lm_negative_model_kwargs = self._update_model_kwargs_for_generation(
                     tts_lm_negative_outputs, tts_lm_negative_model_kwargs, is_encoder_decoder=False,
                 )
@@ -707,7 +715,8 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
     def sample_speech_tokens(self, condition, neg_condition, cfg_scale=3.0):
         self.model.noise_scheduler.set_timesteps(self.ddpm_inference_steps)
         condition = torch.cat([condition, neg_condition], dim=0).to(self.model.prediction_head.device)
-        speech = torch.randn(condition.shape[0], self.config.acoustic_vae_dim).to(condition)
+        # speech = torch.randn(condition.shape[0], self.config.acoustic_vae_dim).to(condition)
+        speech = torch.zeros(condition.shape[0], self.config.acoustic_vae_dim).to(condition)
         for t in self.model.noise_scheduler.timesteps:
             half = speech[: len(speech) // 2]
             combined = torch.cat([half, half], dim=0)
@@ -716,6 +725,7 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
             half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
             eps = torch.cat([half_eps, half_eps], dim=0)
             speech = self.model.noise_scheduler.step(eps, t, speech).prev_sample
+            # print("Sampling step:", t.item(), "Speech shape:", speech)
         return speech[: len(speech) // 2]
     
 

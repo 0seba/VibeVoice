@@ -250,7 +250,14 @@ def main():
 
     print(f"Starting generation with cfg_scale: {args.cfg_scale}")
 
-    model = WrappedInferenceModel(model, "vibe_voice_lm_model_seqlen_32.mlpackage")
+    # model = WrappedInferenceModel(
+    #     model,
+    #     "vibe_voice_lm_model_seqlen_32.mlpackage",
+    #     "vibe_voice_tts_lm_model_seqlen_8.mlpackage",
+    #     "diffusion_head_model.mlpackage",
+    #     # "decoder_coreml 2.mlpackage",
+    #     "decoder_coreml_1_f16.mlpackage",
+    # )
 
     # Generate audio
     start_time = time.time()
